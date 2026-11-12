@@ -196,17 +196,29 @@ async function sonarAmbiente(id) {
   estado.ambienteCargando = true;
   estado.aviso = '';
   sincronizar();
-  const f = { el: null, nivel: 0 };
+  const f = { el: null, nivel: 0, id };
   try {
     f.el = new Audio(await cargarPista(AMBIENTES.find((a) => a.id === id)));
     f.el.loop = true;
     f.el.volume = 0;
+    // El propio <audio> manda: si el móvil lo pausa o lo reanuda (pantalla de
+    // bloqueo, auriculares, una llamada), la app lo refleja.
+    f.el.addEventListener('pause', () => {
+      if (fuente !== f || !estado.ambienteSuena) return;
+      estado.ambienteSuena = false;
+      sincronizar();
+    });
+    f.el.addEventListener('play', () => {
+      if (fuente !== f || estado.ambienteSuena) return;
+      estado.ambienteSuena = true;
+      rampa(f, 1, 1);
+      sincronizar();
+    });
     if (mio !== turno) return;
     await f.el.play();
   } catch (e) {
     console.error(e);
     if (mio !== turno) return;
-    estado.ambiente = null;
     estado.ambienteCargando = false;
     estado.aviso = 'No se pudo reproducir ese sonido';
     sincronizar();
@@ -229,12 +241,23 @@ function callarAmbiente(seg) {
   rampa(f, 0, seg, () => f.el.pause());
 }
 
-function pararAmbiente(olvidar) {
+// Pausa sin soltar el <audio>: reanudar el mismo elemento es lo único que el
+// móvil permite hacer desde la pantalla de bloqueo.
+function pausarAmbiente(seg) {
+  turno++;
+  estado.ambienteSuena = false;
+  estado.ambienteCargando = false;
+  if (!fuente) return;
+  const f = fuente;
+  rampa(f, 0, seg, () => f.el.pause());
+}
+
+function pararAmbiente() {
   turno++;
   callarAmbiente(0.6);
   estado.ambienteSuena = false;
   estado.ambienteCargando = false;
-  if (olvidar) estado.ambiente = null;
+  estado.ambiente = null;
 }
 
 async function campana() {
@@ -354,7 +377,7 @@ function restaurarFundido() {
 }
 
 function pausar() {
-  pararAmbiente(false);
+  pausarAmbiente(0.3);
   if (ytListo && estado.musica) yt.pauseVideo();
   estado.musicaSuena = false;
   sincronizar();
@@ -368,15 +391,22 @@ function reanudar() {
     return;
   }
   estado.terminada = false;
-  if (estado.ambiente) sonarAmbiente(estado.ambiente);
+  if (estado.ambiente) {
+    if (fuente && fuente.id === estado.ambiente) {
+      if (fuente.el.paused) fuente.el.play().catch(() => sonarAmbiente(estado.ambiente));
+      else { // aún se estaba apagando: se vuelve a subir
+        estado.ambienteSuena = true;
+        rampa(fuente, 1, 1);
+        sincronizar();
+      }
+    } else sonarAmbiente(estado.ambiente);
+  }
   if (estado.musica) { if (ytListo) yt.playVideo(); else sonarMusica(estado.musica); }
 }
 
 function terminarSesion() {
   if (prefs.campana) campana(); // antes de callar, para que el móvil no duerma la app
-  turno++;
-  callarAmbiente(0);
-  estado.ambienteSuena = false;
+  pausarAmbiente(0);
   if (ytListo && estado.musica) yt.pauseVideo();
   estado.musicaSuena = false;
   estado.finEn = null;
@@ -518,7 +548,7 @@ function pintarCuenta() {
 function iniciar() {
   crearTeclas($('ambientes'), AMBIENTES, (id) => {
     if (id === estado.ambiente && (estado.ambienteSuena || estado.ambienteCargando)) {
-      pararAmbiente(true);
+      pararAmbiente();
       sincronizar();
     } else sonarAmbiente(id);
   });
