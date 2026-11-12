@@ -27,50 +27,55 @@ const curva = (v) => (v / 100) ** 2; // el oído percibe el volumen de forma no 
 
 // ───────────────────────── Motor de ambientes ─────────────────────────
 
-let ctx, salida, volNodo, fundidoNodo, ancla;
-let anclaHasta = 0;  // mantiene el ancla viva mientras suena la campana final
-let fuente = null;   // { src, g } del ambiente que suena
-let turno = 0;       // descarta cargas que ya no interesan
-const buffers = new Map();
+// El sonido sale siempre por un <audio> normal: es lo que Android reconoce
+// como música (control en la pantalla de bloqueo, sigue con la pantalla apagada).
+// El AudioContext solo se usa para preparar los bucles, nunca para sonar.
+let ctx;
+let fuente = null;      // { el, nivel } del ambiente que suena
+let fundidoFinal = 1;   // baja de 1 a 0 al acabar la sesión
+let turno = 0;          // descarta cargas que ya no interesan
+const pistas = new Map(); // id → URL del bucle ya preparado
+let urlCampana = null;
 
 function motor() {
-  if (!ctx) {
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    salida = ctx.createGain();
-    volNodo = ctx.createGain();
-    volNodo.gain.value = curva(prefs.volAmbiente);
-    fundidoNodo = ctx.createGain();
-    volNodo.connect(fundidoNodo);
-    fundidoNodo.connect(salida);
-    salida.connect(ctx.destination);
-    ancla = crearAncla();
+  if (ctx) return;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.suspend(); // decodificar funciona igual y no gasta batería
+}
+
+function aWav(buf) {
+  const canales = buf.numberOfChannels, n = buf.length, sr = buf.sampleRate;
+  const bytes = n * canales * 2;
+  const v = new DataView(new ArrayBuffer(44 + bytes));
+  const texto = (pos, t) => [...t].forEach((ch, i) => v.setUint8(pos + i, ch.charCodeAt(0)));
+  texto(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); texto(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, canales, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * canales * 2, true);
+  v.setUint16(32, canales * 2, true); v.setUint16(34, 16, true);
+  texto(36, 'data'); v.setUint32(40, bytes, true);
+  const muestras = new Int16Array(v.buffer, 44, n * canales);
+  for (let c = 0; c < canales; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < n; i++) muestras[i * canales + c] = Math.max(-1, Math.min(1, d[i])) * 32767;
   }
-  if (ctx.state !== 'running') ctx.resume();
+  return URL.createObjectURL(new Blob([v], { type: 'audio/wav' }));
 }
 
-// Un <audio> normal en bucle, prácticamente inaudible, que suena a la vez que
-// el ambiente. Es lo que hace que el móvil muestre el control de pausa en la
-// pantalla de bloqueo y mantenga la app viva con la pantalla apagada.
-function crearAncla() {
-  const sr = 8000, n = sr * 12;
-  const wav = new DataView(new ArrayBuffer(44 + n * 2));
-  const texto = (pos, t) => [...t].forEach((ch, i) => wav.setUint8(pos + i, ch.charCodeAt(0)));
-  texto(0, 'RIFF'); wav.setUint32(4, 36 + n * 2, true); texto(8, 'WAVEfmt ');
-  wav.setUint32(16, 16, true); wav.setUint16(20, 1, true); wav.setUint16(22, 1, true);
-  wav.setUint32(24, sr, true); wav.setUint32(28, sr * 2, true);
-  wav.setUint16(32, 2, true); wav.setUint16(34, 16, true);
-  texto(36, 'data'); wav.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) wav.setInt16(44 + i * 2, Math.round(Math.random() * 4 - 2), true);
-  const a = new Audio(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
-  a.loop = true;
-  return a;
+function ponerVolumen(f) {
+  f.el.volume = Math.max(0, Math.min(1, curva(prefs.volAmbiente) * f.nivel * (f.factor ?? fundidoFinal)));
 }
 
-function ajustarAncla() {
-  if (!ancla) return;
-  const quiere = estado.ambienteSuena || estado.ambienteCargando || Date.now() < anclaHasta;
-  if (quiere && ancla.paused) ancla.play().catch(() => {});
-  else if (!quiere && !ancla.paused) ancla.pause();
+function rampa(f, hasta, seg, alAcabar) {
+  clearInterval(f.reloj);
+  const desde = f.nivel, t0 = performance.now();
+  const paso = () => {
+    const k = seg > 0 ? Math.min(1, (performance.now() - t0) / (seg * 1000)) : 1;
+    f.nivel = desde + (hasta - desde) * k;
+    ponerVolumen(f);
+    if (k >= 1) { clearInterval(f.reloj); if (alAcabar) alAcabar(); }
+  };
+  f.reloj = setInterval(paso, 40);
+  paso();
 }
 
 // Funde el final de la grabación con su principio para que el bucle no se note.
@@ -163,8 +168,8 @@ async function viento(seg) {
   return normalizar(await off.startRendering(), 0.075);
 }
 
-async function cargarBuffer(a) {
-  if (buffers.has(a.id)) return buffers.get(a.id);
+async function cargarPista(a) {
+  if (pistas.has(a.id)) return pistas.get(a.id);
   let buf;
   if (a.generado === 'marron') buf = ruidoMarron(24);
   else if (a.generado === 'viento') buf = await viento(40);
@@ -174,10 +179,14 @@ async function cargarBuffer(a) {
     const datos = await r.arrayBuffer();
     buf = await new Promise((ok, mal) => ctx.decodeAudioData(datos, ok, mal));
   }
-  buf = hacerBucle(buf);
-  buffers.set(a.id, buf);
-  if (buffers.size > 2) buffers.delete(buffers.keys().next().value); // memoria del móvil
-  return buf;
+  const url = aWav(hacerBucle(buf));
+  pistas.set(a.id, url);
+  if (pistas.size > 3) { // memoria del móvil
+    const [viejo, urlVieja] = pistas.entries().next().value;
+    pistas.delete(viejo);
+    URL.revokeObjectURL(urlVieja);
+  }
+  return url;
 }
 
 async function sonarAmbiente(id) {
@@ -187,31 +196,26 @@ async function sonarAmbiente(id) {
   estado.ambienteCargando = true;
   estado.aviso = '';
   sincronizar();
-  let buf;
+  const f = { el: null, nivel: 0 };
   try {
-    buf = await cargarBuffer(AMBIENTES.find((a) => a.id === id));
+    f.el = new Audio(await cargarPista(AMBIENTES.find((a) => a.id === id)));
+    f.el.loop = true;
+    f.el.volume = 0;
+    if (mio !== turno) return;
+    await f.el.play();
   } catch (e) {
     console.error(e);
     if (mio !== turno) return;
     estado.ambiente = null;
     estado.ambienteCargando = false;
-    estado.aviso = 'No se pudo cargar ese sonido';
+    estado.aviso = 'No se pudo reproducir ese sonido';
     sincronizar();
     return;
   }
-  if (mio !== turno) return;
+  if (mio !== turno) { f.el.pause(); return; }
   callarAmbiente(1.5);
-  const t = ctx.currentTime;
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  src.loop = true;
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0, t);
-  g.gain.linearRampToValueAtTime(1, t + 2);
-  src.connect(g);
-  g.connect(volNodo);
-  src.start(t);
-  fuente = { src, g };
+  fuente = f;
+  rampa(f, 1, 2);
   estado.ambienteCargando = false;
   estado.ambienteSuena = true;
   sincronizar();
@@ -219,13 +223,10 @@ async function sonarAmbiente(id) {
 
 function callarAmbiente(seg) {
   if (!fuente) return;
-  const { src, g } = fuente;
-  const t = ctx.currentTime;
-  g.gain.cancelScheduledValues(t);
-  g.gain.setValueAtTime(g.gain.value, t);
-  g.gain.linearRampToValueAtTime(0, t + seg);
-  src.stop(t + seg + 0.05);
+  const f = fuente;
   fuente = null;
+  f.factor = fundidoFinal; // conserva el fundido de fin de sesión mientras se apaga
+  rampa(f, 0, seg, () => f.el.pause());
 }
 
 function pararAmbiente(olvidar) {
@@ -236,21 +237,25 @@ function pararAmbiente(olvidar) {
   if (olvidar) estado.ambiente = null;
 }
 
-function campana() {
+async function campana() {
   motor();
-  const t = ctx.currentTime + 0.8;
-  for (const [razon, amp, dura] of [[1, 0.2, 8], [2.76, 0.08, 5], [5.4, 0.035, 3]]) {
-    const o = ctx.createOscillator();
-    o.frequency.value = 396 * razon;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(amp, t + 0.03);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dura);
-    o.connect(g);
-    g.connect(salida);
-    o.start(t);
-    o.stop(t + dura + 0.1);
+  if (!urlCampana) {
+    const sr = 44100;
+    const off = new OfflineAudioContext(1, sr * 9, sr);
+    for (const [razon, amp, dura] of [[1, 0.2, 8], [2.76, 0.08, 5], [5.4, 0.035, 3]]) {
+      const o = off.createOscillator();
+      o.frequency.value = 396 * razon;
+      const g = off.createGain();
+      g.gain.setValueAtTime(0.0001, 0.3);
+      g.gain.linearRampToValueAtTime(amp, 0.33);
+      g.gain.exponentialRampToValueAtTime(0.0001, 0.3 + dura);
+      o.connect(g);
+      g.connect(off.destination);
+      o.start(0.3);
+    }
+    urlCampana = aWav(await off.startRendering());
   }
+  new Audio(urlCampana).play().catch(console.error);
 }
 
 // ───────────────────────── Música (YouTube) ─────────────────────────
@@ -344,11 +349,7 @@ let enFundido = false;
 function restaurarFundido() {
   if (!enFundido) return;
   enFundido = false;
-  if (ctx) {
-    const t = ctx.currentTime;
-    fundidoNodo.gain.cancelScheduledValues(t);
-    fundidoNodo.gain.setTargetAtTime(1, t + 0.7, 0.2);
-  }
+  fundidoFinal = 1;
   if (ytListo) yt.setVolume(prefs.volMusica);
 }
 
@@ -372,14 +373,16 @@ function reanudar() {
 }
 
 function terminarSesion() {
-  pararAmbiente(false);
+  if (prefs.campana) campana(); // antes de callar, para que el móvil no duerma la app
+  turno++;
+  callarAmbiente(0);
+  estado.ambienteSuena = false;
   if (ytListo && estado.musica) yt.pauseVideo();
   estado.musicaSuena = false;
   estado.finEn = null;
   estado.restante = null;
   estado.terminada = true;
   restaurarFundido();
-  if (prefs.campana) { anclaHasta = Date.now() + 10000; campana(); }
   sincronizar();
 }
 
@@ -399,11 +402,11 @@ function latido() {
     if (queda < FUNDIDO_FINAL) {
       enFundido = true;
       const f = queda / FUNDIDO_FINAL;
-      if (ctx) fundidoNodo.gain.setTargetAtTime(f * f, ctx.currentTime, 0.3);
+      fundidoFinal = f * f;
+      if (fuente) ponerVolumen(fuente);
       if (ytListo) yt.setVolume(prefs.volMusica * f);
     }
   }
-  ajustarAncla();
   pintarCuenta();
 }
 
@@ -423,7 +426,6 @@ function sincronizar() {
   }
   if (!estado.ambiente && !estado.musica) estado.restante = null;
   pantallaDespierta(estado.musicaSuena);
-  ajustarAncla();
   pintar();
 }
 
@@ -548,7 +550,7 @@ function iniciar() {
     });
   };
   deslizador('vol-ambiente', 'volAmbiente', () => {
-    if (ctx) volNodo.gain.setTargetAtTime(curva(prefs.volAmbiente), ctx.currentTime, 0.05);
+    if (fuente) ponerVolumen(fuente);
   });
   deslizador('vol-musica', 'volMusica', () => {
     if (ytListo && !enFundido) yt.setVolume(prefs.volMusica);

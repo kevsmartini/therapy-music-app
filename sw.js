@@ -1,5 +1,5 @@
 // Sube este número cada vez que cambies algún archivo de la app.
-const VERSION = 'calma-v2';
+const VERSION = 'calma-v3';
 
 const ARCHIVOS = [
   './',
@@ -29,11 +29,23 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// Solo lo propio se sirve desde la caché; YouTube va siempre por la red.
+// Solo lo propio pasa por aquí; YouTube va siempre por la red.
+// Los audios salen de la caché; el resto se pide primero a la red para que
+// las actualizaciones lleguen a la primera, y de la caché si no hay conexión.
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
+  const enCache = () => caches.match(e.request, { ignoreSearch: true });
+  if (url.pathname.includes('/audio/')) {
+    e.respondWith(enCache().then((guardado) => guardado || fetch(e.request)));
+    return;
+  }
   e.respondWith(
-    caches.match(e.request, { ignoreSearch: true }).then((guardado) => guardado || fetch(e.request))
+    fetch(e.request, { cache: 'no-cache' })
+      .then((r) => {
+        if (r.ok) { const copia = r.clone(); caches.open(VERSION).then((c) => c.put(e.request, copia)); }
+        return r;
+      })
+      .catch(() => enCache().then((guardado) => guardado || Response.error()))
   );
 });
