@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Calma — música para sesión</title>
+<meta name="description" content="Sonidos de ambiente y música relajante para sesiones de masaje y terapia corporal.">
+<meta name="theme-color" content="#171412">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <h1>Calma</h1>
+  <p id="estado-red" class="red" hidden>Sin conexión · solo ambientes</p>
+</header>
+
+<section class="panel sesion" aria-labelledby="t-sesion">
+  <h2 id="t-sesion">Duración de la sesión</h2>
+  <div id="duraciones" class="chips" role="radiogroup" aria-labelledby="t-sesion"></div>
+  <label class="interruptor">
+    <input type="checkbox" id="campana">
+    <span class="pista" aria-hidden="true"></span>
+    <span>Campana suave al terminar</span>
+  </label>
+</section>
+
+<main class="columnas">
+  <section class="panel" aria-labelledby="t-ambiente">
+    <div class="cabecera">
+      <h2 id="t-ambiente">Ambiente</h2>
+      <input type="range" id="vol-ambiente" min="0" max="100" value="70" aria-label="Volumen del ambiente">
+    </div>
+    <div id="ambientes" class="rejilla"></div>
+    <p class="nota">Funciona sin conexión y con la pantalla apagada.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="t-musica">
+    <div class="cabecera">
+      <h2 id="t-musica">Música</h2>
+      <input type="range" id="vol-musica" min="0" max="100" value="60" aria-label="Volumen de la música">
+    </div>
+    <div id="musicas" class="rejilla"></div>
+    <div id="reproductor" class="reproductor" hidden>
+      <div class="marco"><div id="yt"></div></div>
+      <div class="acciones">
+        <button type="button" id="otra" class="secundario">Otra pista</button>
+        <button type="button" id="quitar" class="secundario">Quitar música</button>
+      </div>
+    </div>
+    <p class="nota" id="nota-musica">Desde YouTube: necesita conexión y la pantalla encendida (la app la mantiene despierta).</p>
+  </section>
+</main>
+
+<details class="creditos">
+  <summary>Créditos de los sonidos</summary>
+  <ul>
+    <li>Lluvia — «Rain against the window», cori. Dominio público.</li>
+    <li>Bosque — «Réveil des oiseaux», Joseph Sardin. CC0.</li>
+    <li>Mar — «Ocean Waves on a Tropical Beach», Jarrod Stanley. CC0.</li>
+    <li>Río — «Sanna river rapids», Jarrod Stanley. CC0.</li>
+    <li>Viento y ruido suave se generan en el propio dispositivo.</li>
+  </ul>
+  <p>Grabaciones obtenidas de Wikimedia Commons. La música se reproduce con el reproductor oficial de YouTube y pertenece a sus respectivos canales.</p>
+</details>
+
+<div class="barra" role="region" aria-label="Reproducción">
+  <button type="button" id="principal" class="principal" aria-label="Reproducir">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path id="icono-principal" d="M8 5v14l11-7z"/></svg>
+  </button>
+  <div class="ahora">
+    <strong id="ahora-titulo">Elige un ambiente o una música</strong>
+    <span id="ahora-detalle"></span>
+  </div>
+  <div id="cuenta" class="cuenta" aria-live="off"></div>
+</div>
+
+<script src="catalog.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

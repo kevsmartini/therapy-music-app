@@ -1,0 +1,566 @@
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const FUNDIDO_FINAL = 30000; // ms de fundido antes de terminar la sesión
+
+const prefs = Object.assign(
+  { volAmbiente: 70, volMusica: 60, minutos: 60, campana: true },
+  JSON.parse(localStorage.getItem('calma') || '{}')
+);
+const guardar = () => localStorage.setItem('calma', JSON.stringify(prefs));
+
+const estado = {
+  ambiente: null,        // id del ambiente elegido
+  ambienteSuena: false,
+  ambienteCargando: false,
+  musica: null,          // id de la categoría de música elegida
+  pista: 0,
+  musicaSuena: false,
+  finEn: null,           // marca de tiempo en la que acaba la sesión
+  restante: null,        // ms que quedaban al pausar
+  terminada: false,
+  aviso: '',
+};
+
+const sonando = () => estado.ambienteSuena || estado.musicaSuena;
+const curva = (v) => (v / 100) ** 2; // el oído percibe el volumen de forma no lineal
+
+// ───────────────────────── Motor de ambientes ─────────────────────────
+
+let ctx, salida, volNodo, fundidoNodo, elemento;
+let fuente = null;   // { src, g } del ambiente que suena
+let turno = 0;       // descarta cargas que ya no interesan
+const buffers = new Map();
+
+function motor() {
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    salida = ctx.createGain();
+    volNodo = ctx.createGain();
+    volNodo.gain.value = curva(prefs.volAmbiente);
+    fundidoNodo = ctx.createGain();
+    volNodo.connect(fundidoNodo);
+    fundidoNodo.connect(salida);
+    // Sacar el sonido por un <audio> hace que el móvil lo trate como
+    // música: sigue sonando con la pantalla apagada.
+    try {
+      const destino = ctx.createMediaStreamDestination();
+      salida.connect(destino);
+      elemento = new Audio();
+      elemento.srcObject = destino.stream;
+      elemento.play().catch(directo);
+    } catch {
+      directo();
+    }
+  }
+  if (ctx.state !== 'running') ctx.resume();
+  if (elemento && elemento.paused) elemento.play().catch(() => {});
+}
+
+function directo() {
+  try { salida.disconnect(); } catch {}
+  salida.connect(ctx.destination);
+  elemento = null;
+}
+
+// Funde el final de la grabación con su principio para que el bucle no se note.
+function hacerBucle(buf) {
+  const sr = buf.sampleRate;
+  const recorte = Math.floor(0.2 * sr);
+  const cruce = Math.floor(3 * sr);
+  const largo = buf.length - 2 * recorte;
+  const n = largo - cruce;
+  const out = ctx.createBuffer(buf.numberOfChannels, n, sr);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const s = buf.getChannelData(c).subarray(recorte, recorte + largo);
+    const o = out.getChannelData(c);
+    o.set(s.subarray(0, n));
+    for (let i = 0; i < cruce; i++) {
+      const t = (i / cruce) * Math.PI / 2;
+      o[i] = s[i] * Math.sin(t) + s[n + i] * Math.cos(t);
+    }
+  }
+  return out;
+}
+
+function normalizar(buf, rmsObjetivo) {
+  let suma = 0, total = 0;
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < d.length; i += 7) { suma += d[i] * d[i]; total++; }
+  }
+  const k = rmsObjetivo / (Math.sqrt(suma / total) || 1);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < d.length; i++) d[i] = Math.max(-1, Math.min(1, d[i] * k));
+  }
+  return buf;
+}
+
+function ruidoMarron(seg) {
+  const sr = ctx.sampleRate;
+  const buf = ctx.createBuffer(2, seg * sr, sr);
+  for (let c = 0; c < 2; c++) {
+    const d = buf.getChannelData(c);
+    let ultimo = 0;
+    for (let i = 0; i < d.length; i++) {
+      ultimo = (ultimo + 0.02 * (Math.random() * 2 - 1)) / 1.02;
+      d[i] = ultimo;
+    }
+  }
+  return normalizar(buf, 0.09);
+}
+
+async function viento(seg) {
+  const sr = ctx.sampleRate;
+  const off = new OfflineAudioContext(2, seg * sr, sr);
+  const blanco = off.createBuffer(2, seg * sr, sr);
+  for (let c = 0; c < 2; c++) {
+    const d = blanco.getChannelData(c);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const src = off.createBufferSource();
+  src.buffer = blanco;
+  const separador = off.createChannelSplitter(2);
+  const mezclador = off.createChannelMerger(2);
+  src.connect(separador);
+  const onda = (base, partes) => {
+    const fases = partes.map(() => Math.random() * 6.283);
+    const puntos = new Float32Array(600);
+    for (let i = 0; i < puntos.length; i++) {
+      const t = (i / puntos.length) * seg;
+      puntos[i] = base + partes.reduce((a, [amp, periodo], j) => a + amp * Math.sin(6.283 * t / periodo + fases[j]), 0);
+    }
+    return puntos;
+  };
+  for (let c = 0; c < 2; c++) {
+    const paso = off.createBiquadFilter();
+    paso.type = 'bandpass';
+    paso.Q.value = 0.8;
+    paso.frequency.setValueCurveAtTime(onda(520, [[230, 11], [110, 4.3]]), 0, seg);
+    const suave = off.createBiquadFilter();
+    suave.type = 'lowpass';
+    suave.frequency.value = 1400;
+    const g = off.createGain();
+    g.gain.setValueCurveAtTime(onda(0.55, [[0.28, 13], [0.14, 5.1]]), 0, seg);
+    separador.connect(paso, c);
+    paso.connect(suave);
+    suave.connect(g);
+    g.connect(mezclador, 0, c);
+  }
+  mezclador.connect(off.destination);
+  src.start();
+  return normalizar(await off.startRendering(), 0.075);
+}
+
+async function cargarBuffer(a) {
+  if (buffers.has(a.id)) return buffers.get(a.id);
+  let buf;
+  if (a.generado === 'marron') buf = ruidoMarron(24);
+  else if (a.generado === 'viento') buf = await viento(40);
+  else {
+    const r = await fetch(a.archivo);
+    if (!r.ok) throw new Error('No se pudo cargar ' + a.archivo);
+    const datos = await r.arrayBuffer();
+    buf = await new Promise((ok, mal) => ctx.decodeAudioData(datos, ok, mal));
+  }
+  buf = hacerBucle(buf);
+  buffers.set(a.id, buf);
+  if (buffers.size > 2) buffers.delete(buffers.keys().next().value); // memoria del móvil
+  return buf;
+}
+
+async function sonarAmbiente(id) {
+  motor();
+  const mio = ++turno;
+  estado.ambiente = id;
+  estado.ambienteCargando = true;
+  estado.aviso = '';
+  sincronizar();
+  let buf;
+  try {
+    buf = await cargarBuffer(AMBIENTES.find((a) => a.id === id));
+  } catch (e) {
+    console.error(e);
+    if (mio !== turno) return;
+    estado.ambiente = null;
+    estado.ambienteCargando = false;
+    estado.aviso = 'No se pudo cargar ese sonido';
+    sincronizar();
+    return;
+  }
+  if (mio !== turno) return;
+  callarAmbiente(1.5);
+  const t = ctx.currentTime;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(1, t + 2);
+  src.connect(g);
+  g.connect(volNodo);
+  src.start(t);
+  fuente = { src, g };
+  estado.ambienteCargando = false;
+  estado.ambienteSuena = true;
+  sincronizar();
+}
+
+function callarAmbiente(seg) {
+  if (!fuente) return;
+  const { src, g } = fuente;
+  const t = ctx.currentTime;
+  g.gain.cancelScheduledValues(t);
+  g.gain.setValueAtTime(g.gain.value, t);
+  g.gain.linearRampToValueAtTime(0, t + seg);
+  src.stop(t + seg + 0.05);
+  fuente = null;
+}
+
+function pararAmbiente(olvidar) {
+  turno++;
+  callarAmbiente(0.6);
+  estado.ambienteSuena = false;
+  estado.ambienteCargando = false;
+  if (olvidar) estado.ambiente = null;
+}
+
+function campana() {
+  motor();
+  const t = ctx.currentTime + 0.8;
+  for (const [razon, amp, dura] of [[1, 0.2, 8], [2.76, 0.08, 5], [5.4, 0.035, 3]]) {
+    const o = ctx.createOscillator();
+    o.frequency.value = 396 * razon;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(amp, t + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dura);
+    o.connect(g);
+    g.connect(salida);
+    o.start(t);
+    o.stop(t + dura + 0.1);
+  }
+}
+
+// ───────────────────────── Música (YouTube) ─────────────────────────
+
+let yt = null, ytListo = false, ytCarga = null, ytVideo = null, ytErrores = 0;
+
+function cargarYT() {
+  return (ytCarga ||= new Promise((ok, mal) => {
+    window.onYouTubeIframeAPIReady = ok;
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.onerror = () => { ytCarga = null; s.remove(); mal(new Error('YouTube no disponible')); };
+    document.head.append(s);
+  }));
+}
+
+function videoActual() {
+  const cat = MUSICA.find((m) => m.id === estado.musica);
+  return cat ? cat.videos[estado.pista % cat.videos.length] : null;
+}
+
+async function sonarMusica(id) {
+  motor();
+  if (id !== estado.musica) { estado.musica = id; estado.pista = 0; ytErrores = 0; }
+  estado.aviso = '';
+  $('reproductor').hidden = false;
+  sincronizar();
+  try {
+    await cargarYT();
+  } catch {
+    quitarMusica();
+    estado.aviso = 'No se pudo conectar con YouTube';
+    sincronizar();
+    return;
+  }
+  const video = videoActual();
+  if (!video) return;
+  if (!yt) {
+    ytVideo = video;
+    yt = new YT.Player('yt', {
+      host: 'https://www.youtube-nocookie.com',
+      videoId: video,
+      playerVars: { autoplay: 1, playsinline: 1, rel: 0 },
+      events: {
+        onReady() {
+          ytListo = true;
+          yt.setVolume(prefs.volMusica);
+          const ahora = videoActual();
+          if (!ahora) return;
+          if (ahora !== ytVideo) { ytVideo = ahora; yt.loadVideoById(ahora); } else yt.playVideo();
+        },
+        onStateChange(e) {
+          if (e.data === 1) { estado.musicaSuena = true; ytErrores = 0; }
+          else if (e.data === 2) estado.musicaSuena = false;
+          else if (e.data === 0) otraPista();
+          sincronizar();
+        },
+        onError() {
+          const cat = MUSICA.find((m) => m.id === estado.musica);
+          if (cat && ++ytErrores < cat.videos.length) return otraPista();
+          quitarMusica();
+          estado.aviso = 'Esos vídeos ya no están disponibles';
+          sincronizar();
+        },
+      },
+    });
+  } else if (ytListo) {
+    ytVideo = video;
+    yt.setVolume(prefs.volMusica);
+    yt.loadVideoById(video);
+  }
+}
+
+function otraPista() {
+  if (!estado.musica) return;
+  estado.pista++;
+  sonarMusica(estado.musica);
+}
+
+function quitarMusica() {
+  estado.musica = null;
+  estado.musicaSuena = false;
+  if (ytListo) yt.stopVideo();
+  $('reproductor').hidden = true;
+}
+
+// ───────────────────────── Sesión y temporizador ─────────────────────────
+
+let enFundido = false;
+
+function restaurarFundido() {
+  if (!enFundido) return;
+  enFundido = false;
+  if (ctx) {
+    const t = ctx.currentTime;
+    fundidoNodo.gain.cancelScheduledValues(t);
+    fundidoNodo.gain.setTargetAtTime(1, t + 0.7, 0.2);
+  }
+  if (ytListo) yt.setVolume(prefs.volMusica);
+}
+
+function pausar() {
+  pararAmbiente(false);
+  if (ytListo && estado.musica) yt.pauseVideo();
+  estado.musicaSuena = false;
+  sincronizar();
+}
+
+function reanudar() {
+  motor();
+  if (!estado.ambiente && !estado.musica) {
+    estado.aviso = 'Toca primero un ambiente o una música';
+    sincronizar();
+    return;
+  }
+  estado.terminada = false;
+  if (estado.ambiente) sonarAmbiente(estado.ambiente);
+  if (estado.musica) { if (ytListo) yt.playVideo(); else sonarMusica(estado.musica); }
+}
+
+function terminarSesion() {
+  pararAmbiente(false);
+  if (ytListo && estado.musica) yt.pauseVideo();
+  estado.musicaSuena = false;
+  estado.finEn = null;
+  estado.restante = null;
+  estado.terminada = true;
+  restaurarFundido();
+  if (prefs.campana) campana();
+  sincronizar();
+}
+
+function elegirDuracion(min) {
+  prefs.minutos = min;
+  guardar();
+  estado.restante = null;
+  estado.finEn = sonando() && min > 0 ? Date.now() + min * 60000 : null;
+  restaurarFundido();
+  sincronizar();
+}
+
+function latido() {
+  if (estado.finEn) {
+    const queda = estado.finEn - Date.now();
+    if (queda <= 0) return terminarSesion();
+    if (queda < FUNDIDO_FINAL) {
+      enFundido = true;
+      const f = queda / FUNDIDO_FINAL;
+      if (ctx) fundidoNodo.gain.setTargetAtTime(f * f, ctx.currentTime, 0.3);
+      if (ytListo) yt.setVolume(prefs.volMusica * f);
+    }
+  }
+  pintarCuenta();
+}
+
+// Punto único donde se ajusta todo lo que depende del estado.
+function sincronizar() {
+  const suena = sonando();
+  if (suena) {
+    estado.terminada = false;
+    if (!estado.finEn && prefs.minutos > 0) {
+      estado.finEn = Date.now() + (estado.restante ?? prefs.minutos * 60000);
+      estado.restante = null;
+    }
+  } else if (estado.finEn) {
+    estado.restante = estado.finEn - Date.now();
+    estado.finEn = null;
+    restaurarFundido();
+  }
+  if (!estado.ambiente && !estado.musica) estado.restante = null;
+  pantallaDespierta(estado.musicaSuena);
+  pintar();
+}
+
+let cerrojo = null;
+async function pantallaDespierta(si) {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    if (si && !cerrojo && document.visibilityState === 'visible') {
+      cerrojo = await navigator.wakeLock.request('screen');
+      cerrojo.addEventListener('release', () => { cerrojo = null; });
+    } else if (!si && cerrojo) {
+      await cerrojo.release();
+    }
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') pantallaDespierta(estado.musicaSuena);
+});
+
+// ───────────────────────── Interfaz ─────────────────────────
+
+const icono = (d) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${d}"/></svg>`;
+
+function crearTeclas(contenedor, lista, alTocar) {
+  for (const item of lista) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tecla';
+    b.dataset.id = item.id;
+    b.innerHTML = icono(item.icono) + `<span>${item.nombre}</span>`;
+    b.addEventListener('click', () => alTocar(item.id));
+    contenedor.append(b);
+  }
+}
+
+function pintar() {
+  for (const b of $('ambientes').children) {
+    const mio = b.dataset.id === estado.ambiente;
+    b.setAttribute('aria-pressed', String(mio && estado.ambienteSuena));
+    b.classList.toggle('cargando', mio && estado.ambienteCargando);
+  }
+  for (const b of $('musicas').children) {
+    const mio = b.dataset.id === estado.musica;
+    b.setAttribute('aria-pressed', String(mio && estado.musicaSuena));
+    b.classList.toggle('cargando', mio && !estado.musicaSuena);
+    b.disabled = !navigator.onLine;
+  }
+  $('estado-red').hidden = navigator.onLine;
+
+  const suena = sonando();
+  $('icono-principal').setAttribute('d', suena ? 'M7 5h4v14H7zM13 5h4v14h-4z' : 'M8 5v14l11-7z');
+  $('principal').setAttribute('aria-label', suena ? 'Pausar' : 'Reproducir');
+
+  const nombres = [
+    AMBIENTES.find((a) => a.id === estado.ambiente)?.nombre,
+    MUSICA.find((m) => m.id === estado.musica)?.nombre,
+  ].filter(Boolean);
+  $('ahora-titulo').textContent = estado.aviso || nombres.join(' + ') || 'Elige un ambiente o una música';
+  $('ahora-detalle').textContent = estado.aviso ? ''
+    : estado.terminada ? 'Sesión terminada'
+    : suena ? 'Sonando'
+    : estado.ambienteCargando ? 'Cargando…'
+    : estado.musica ? 'Toca ▶ en el vídeo si no empieza sola'
+    : nombres.length ? 'En pausa' : '';
+
+  for (const b of $('duraciones').children) {
+    b.setAttribute('aria-checked', String(Number(b.dataset.min) === prefs.minutos));
+  }
+  pintarCuenta();
+
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: nombres.join(' + ') || 'Calma',
+      artist: 'Calma',
+      artwork: [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }],
+    });
+    navigator.mediaSession.playbackState = suena ? 'playing' : 'paused';
+  }
+}
+
+function pintarCuenta() {
+  const ms = estado.finEn ? estado.finEn - Date.now() : estado.restante ?? prefs.minutos * 60000;
+  const el = $('cuenta');
+  if (!prefs.minutos) { el.textContent = ''; return; }
+  const seg = Math.max(0, Math.ceil(ms / 1000));
+  el.textContent = `${Math.floor(seg / 60)}:${String(seg % 60).padStart(2, '0')}`;
+  el.classList.toggle('final', !!estado.finEn && ms < FUNDIDO_FINAL);
+}
+
+function iniciar() {
+  crearTeclas($('ambientes'), AMBIENTES, (id) => {
+    if (id === estado.ambiente && (estado.ambienteSuena || estado.ambienteCargando)) {
+      pararAmbiente(true);
+      sincronizar();
+    } else sonarAmbiente(id);
+  });
+  crearTeclas($('musicas'), MUSICA, (id) => {
+    if (id === estado.musica) { quitarMusica(); sincronizar(); } else sonarMusica(id);
+  });
+
+  for (const min of DURACIONES) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'radio');
+    b.dataset.min = min;
+    b.innerHTML = min ? `${min}<small>min</small>` : '∞<small>libre</small>';
+    b.setAttribute('aria-label', min ? `${min} minutos` : 'Sin límite');
+    b.addEventListener('click', () => elegirDuracion(min));
+    $('duraciones').append(b);
+  }
+
+  const deslizador = (id, clave, aplicar) => {
+    const el = $(id);
+    const poner = () => el.style.setProperty('--v', el.value + '%');
+    el.value = prefs[clave];
+    poner();
+    el.addEventListener('input', () => {
+      prefs[clave] = Number(el.value);
+      poner();
+      guardar();
+      aplicar();
+    });
+  };
+  deslizador('vol-ambiente', 'volAmbiente', () => {
+    if (ctx) volNodo.gain.setTargetAtTime(curva(prefs.volAmbiente), ctx.currentTime, 0.05);
+  });
+  deslizador('vol-musica', 'volMusica', () => {
+    if (ytListo && !enFundido) yt.setVolume(prefs.volMusica);
+  });
+
+  $('campana').checked = prefs.campana;
+  $('campana').addEventListener('change', (e) => { prefs.campana = e.target.checked; guardar(); });
+
+  $('principal').addEventListener('click', () => (sonando() ? pausar() : reanudar()));
+  $('otra').addEventListener('click', otraPista);
+  $('quitar').addEventListener('click', () => { quitarMusica(); sincronizar(); });
+
+  addEventListener('online', pintar);
+  addEventListener('offline', pintar);
+
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.setActionHandler('play', reanudar);
+    navigator.mediaSession.setActionHandler('pause', pausar);
+  }
+
+  setInterval(latido, 500);
+  pintar();
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(console.error);
+}
+
+iniciar();
