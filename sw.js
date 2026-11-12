@@ -1,5 +1,5 @@
 // Sube este número cada vez que cambies algún archivo de la app.
-const VERSION = 'calma-v1';
+const VERSION = 'calma-v2';
 
 const ARCHIVOS = [
   './',

@@ -27,7 +27,8 @@ const curva = (v) => (v / 100) ** 2; // el oído percibe el volumen de forma no 
 
 // ───────────────────────── Motor de ambientes ─────────────────────────
 
-let ctx, salida, volNodo, fundidoNodo, elemento;
+let ctx, salida, volNodo, fundidoNodo, ancla;
+let anclaHasta = 0;  // mantiene el ancla viva mientras suena la campana final
 let fuente = null;   // { src, g } del ambiente que suena
 let turno = 0;       // descarta cargas que ya no interesan
 const buffers = new Map();
@@ -41,26 +42,35 @@ function motor() {
     fundidoNodo = ctx.createGain();
     volNodo.connect(fundidoNodo);
     fundidoNodo.connect(salida);
-    // Sacar el sonido por un <audio> hace que el móvil lo trate como
-    // música: sigue sonando con la pantalla apagada.
-    try {
-      const destino = ctx.createMediaStreamDestination();
-      salida.connect(destino);
-      elemento = new Audio();
-      elemento.srcObject = destino.stream;
-      elemento.play().catch(directo);
-    } catch {
-      directo();
-    }
+    salida.connect(ctx.destination);
+    ancla = crearAncla();
   }
   if (ctx.state !== 'running') ctx.resume();
-  if (elemento && elemento.paused) elemento.play().catch(() => {});
 }
 
-function directo() {
-  try { salida.disconnect(); } catch {}
-  salida.connect(ctx.destination);
-  elemento = null;
+// Un <audio> normal en bucle, prácticamente inaudible, que suena a la vez que
+// el ambiente. Es lo que hace que el móvil muestre el control de pausa en la
+// pantalla de bloqueo y mantenga la app viva con la pantalla apagada.
+function crearAncla() {
+  const sr = 8000, n = sr * 12;
+  const wav = new DataView(new ArrayBuffer(44 + n * 2));
+  const texto = (pos, t) => [...t].forEach((ch, i) => wav.setUint8(pos + i, ch.charCodeAt(0)));
+  texto(0, 'RIFF'); wav.setUint32(4, 36 + n * 2, true); texto(8, 'WAVEfmt ');
+  wav.setUint32(16, 16, true); wav.setUint16(20, 1, true); wav.setUint16(22, 1, true);
+  wav.setUint32(24, sr, true); wav.setUint32(28, sr * 2, true);
+  wav.setUint16(32, 2, true); wav.setUint16(34, 16, true);
+  texto(36, 'data'); wav.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) wav.setInt16(44 + i * 2, Math.round(Math.random() * 4 - 2), true);
+  const a = new Audio(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
+  a.loop = true;
+  return a;
+}
+
+function ajustarAncla() {
+  if (!ancla) return;
+  const quiere = estado.ambienteSuena || estado.ambienteCargando || Date.now() < anclaHasta;
+  if (quiere && ancla.paused) ancla.play().catch(() => {});
+  else if (!quiere && !ancla.paused) ancla.pause();
 }
 
 // Funde el final de la grabación con su principio para que el bucle no se note.
@@ -369,7 +379,7 @@ function terminarSesion() {
   estado.restante = null;
   estado.terminada = true;
   restaurarFundido();
-  if (prefs.campana) campana();
+  if (prefs.campana) { anclaHasta = Date.now() + 10000; campana(); }
   sincronizar();
 }
 
@@ -393,6 +403,7 @@ function latido() {
       if (ytListo) yt.setVolume(prefs.volMusica * f);
     }
   }
+  ajustarAncla();
   pintarCuenta();
 }
 
@@ -412,6 +423,7 @@ function sincronizar() {
   }
   if (!estado.ambiente && !estado.musica) estado.restante = null;
   pantallaDespierta(estado.musicaSuena);
+  ajustarAncla();
   pintar();
 }
 
