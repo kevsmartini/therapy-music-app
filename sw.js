@@ -1,5 +1,5 @@
 // Sube este número cada vez que cambies algún archivo de la app.
-const VERSION = 'calma-v4';
+const VERSION = 'calma-v5';
 
 const ARCHIVOS = [
   './',
@@ -8,9 +8,10 @@ const ARCHIVOS = [
   'catalog.js',
   'app.js',
   'manifest.webmanifest',
-  'icons/icon.svg',
   'icons/icon-192.png',
   'icons/icon-512.png',
+  'icons/maskable-192.png',
+  'icons/maskable-512.png',
   'audio/lluvia.mp3',
   'audio/bosque.mp3',
   'audio/mar.mp3',
