@@ -27,21 +27,20 @@ const curva = (v) => (v / 100) ** 2; // el oído percibe el volumen de forma no 
 
 // ───────────────────────── Motor de ambientes ─────────────────────────
 
-// El sonido sale siempre por un <audio> normal: es lo que Android reconoce
+// El sonido sale siempre por <audio> normales: es lo que Android reconoce
 // como música (control en la pantalla de bloqueo, sigue con la pantalla apagada).
-// El AudioContext solo se usa para preparar los bucles, nunca para sonar.
-let ctx;
-let fuente = null;      // { el, nivel } del ambiente que suena
+//
+// Un <audio> con loop deja un pequeño corte al dar la vuelta. Para evitarlo cada
+// ambiente usa dos <audio> del mismo sonido que se relevan: poco antes de que
+// uno llegue al final, el otro arranca desde el principio y se cruzan.
+const SR = 44100;
+const CRUCE = 5;        // segundos que dura el relevo
+const MARGEN = 0.35;    // silencio de relleno que los mp3 traen en los extremos
+let fuente = null;      // { els, act, nivel, cruce, id } del ambiente elegido
 let fundidoFinal = 1;   // baja de 1 a 0 al acabar la sesión
 let turno = 0;          // descarta cargas que ya no interesan
-const pistas = new Map(); // id → URL del bucle ya preparado
+const pistas = new Map(); // id → URL de los sonidos generados
 let urlCampana = null;
-
-function motor() {
-  if (ctx) return;
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
-  ctx.suspend(); // decodificar funciona igual y no gasta batería
-}
 
 function aWav(buf) {
   const canales = buf.numberOfChannels, n = buf.length, sr = buf.sampleRate;
@@ -62,7 +61,14 @@ function aWav(buf) {
 }
 
 function ponerVolumen(f) {
-  f.el.volume = Math.max(0, Math.min(1, curva(prefs.volAmbiente) * f.nivel * (f.factor ?? fundidoFinal)));
+  const base = Math.max(0, Math.min(1, curva(prefs.volAmbiente) * f.nivel * (f.factor ?? fundidoFinal)));
+  if (f.cruce) {
+    const k = Math.min(1, (performance.now() - f.cruce.t0) / (CRUCE * 1000)) * Math.PI / 2;
+    f.cruce.sale.volume = base * Math.cos(k);
+    f.act.volume = base * Math.sin(k);
+  } else {
+    for (const el of f.els) el.volume = el === f.act ? base : 0;
+  }
 }
 
 function rampa(f, hasta, seg, alAcabar) {
@@ -78,24 +84,27 @@ function rampa(f, hasta, seg, alAcabar) {
   paso();
 }
 
-// Funde el final de la grabación con su principio para que el bucle no se note.
-function hacerBucle(buf) {
-  const sr = buf.sampleRate;
-  const recorte = Math.floor(0.2 * sr);
-  const cruce = Math.floor(3 * sr);
-  const largo = buf.length - 2 * recorte;
-  const n = largo - cruce;
-  const out = ctx.createBuffer(buf.numberOfChannels, n, sr);
-  for (let c = 0; c < buf.numberOfChannels; c++) {
-    const s = buf.getChannelData(c).subarray(recorte, recorte + largo);
-    const o = out.getChannelData(c);
-    o.set(s.subarray(0, n));
-    for (let i = 0; i < cruce; i++) {
-      const t = (i / cruce) * Math.PI / 2;
-      o[i] = s[i] * Math.sin(t) + s[n + i] * Math.cos(t);
-    }
-  }
-  return out;
+// Relevo entre los dos <audio>. Se mide con el reloj, no contando pasos, para
+// que salga bien aunque el móvil ralentice la app con la pantalla apagada.
+function vigilarRelevo(f) {
+  const el = f.act;
+  if (f.cruce || el.paused || !isFinite(el.duration)) return;
+  if (el.duration - el.currentTime > CRUCE + MARGEN) return;
+  const entra = f.els.find((e) => e !== el);
+  entra.currentTime = MARGEN;
+  entra.volume = 0;
+  entra.play().catch(() => {}); // si fallara, el loop del primero sigue sonando
+  f.cruce = { sale: el, t0: performance.now() };
+  f.act = entra;
+  f.relojCruce = setInterval(() => {
+    ponerVolumen(f);
+    if (performance.now() - f.cruce.t0 < CRUCE * 1000) return;
+    clearInterval(f.relojCruce);
+    const sale = f.cruce.sale;
+    f.cruce = null;
+    sale.pause();
+    ponerVolumen(f);
+  }, 40);
 }
 
 function normalizar(buf, rmsObjetivo) {
@@ -113,8 +122,7 @@ function normalizar(buf, rmsObjetivo) {
 }
 
 function ruidoMarron(seg) {
-  const sr = ctx.sampleRate;
-  const buf = ctx.createBuffer(2, seg * sr, sr);
+  const buf = new AudioBuffer({ numberOfChannels: 2, length: seg * SR, sampleRate: SR });
   for (let c = 0; c < 2; c++) {
     const d = buf.getChannelData(c);
     let ultimo = 0;
@@ -127,7 +135,7 @@ function ruidoMarron(seg) {
 }
 
 async function viento(seg) {
-  const sr = ctx.sampleRate;
+  const sr = SR;
   const off = new OfflineAudioContext(2, seg * sr, sr);
   const blanco = off.createBuffer(2, seg * sr, sr);
   for (let c = 0; c < 2; c++) {
@@ -169,68 +177,67 @@ async function viento(seg) {
 }
 
 async function cargarPista(a) {
-  if (pistas.has(a.id)) return pistas.get(a.id);
-  let buf;
-  if (a.generado === 'marron') buf = ruidoMarron(24);
-  else if (a.generado === 'viento') buf = await viento(40);
-  else {
-    const r = await fetch(a.archivo);
-    if (!r.ok) throw new Error('No se pudo cargar ' + a.archivo);
-    const datos = await r.arrayBuffer();
-    buf = await new Promise((ok, mal) => ctx.decodeAudioData(datos, ok, mal));
+  if (a.archivo) return a.archivo;
+  if (!pistas.has(a.id)) {
+    pistas.set(a.id, aWav(a.generado === 'viento' ? await viento(40) : ruidoMarron(24)));
   }
-  const url = aWav(hacerBucle(buf));
-  pistas.set(a.id, url);
-  if (pistas.size > 3) { // memoria del móvil
-    const [viejo, urlVieja] = pistas.entries().next().value;
-    pistas.delete(viejo);
-    URL.revokeObjectURL(urlVieja);
-  }
-  return url;
+  return pistas.get(a.id);
 }
 
-async function sonarAmbiente(id) {
-  motor();
+function sonarAmbiente(id) {
   const mio = ++turno;
   estado.ambiente = id;
   estado.ambienteCargando = true;
   estado.aviso = '';
-  sincronizar();
-  const f = { el: null, nivel: 0, id };
-  try {
-    f.el = new Audio(await cargarPista(AMBIENTES.find((a) => a.id === id)));
-    f.el.loop = true;
-    f.el.volume = 0;
+  // Los dos <audio> se crean y se arrancan dentro del toque: así el móvil
+  // deja después relevarlos y reanudarlos con la pantalla bloqueada.
+  const f = { els: [new Audio(), new Audio()], nivel: 0, cruce: null, id };
+  f.act = f.els[0];
+  for (const el of f.els) {
+    el.loop = true; // red de seguridad si el relevo no llegara a tiempo
+    el.preload = 'auto';
+    el.volume = 0;
     // El propio <audio> manda: si el móvil lo pausa o lo reanuda (pantalla de
     // bloqueo, auriculares, una llamada), la app lo refleja.
-    f.el.addEventListener('pause', () => {
-      if (fuente !== f || !estado.ambienteSuena) return;
+    el.addEventListener('pause', () => {
+      if (fuente !== f || el !== f.act || !estado.ambienteSuena) return;
       estado.ambienteSuena = false;
       sincronizar();
     });
-    f.el.addEventListener('play', () => {
-      if (fuente !== f || estado.ambienteSuena) return;
+    el.addEventListener('play', () => {
+      if (fuente !== f || el !== f.act || estado.ambienteSuena) return;
       estado.ambienteSuena = true;
       rampa(f, 1, 1);
       sincronizar();
     });
-    if (mio !== turno) return;
-    await f.el.play();
-  } catch (e) {
+    el.addEventListener('timeupdate', () => { if (fuente === f) vigilarRelevo(f); });
+  }
+  sincronizar();
+  const fallo = (e) => {
     console.error(e);
     if (mio !== turno) return;
     estado.ambienteCargando = false;
     estado.aviso = 'No se pudo reproducir ese sonido';
     sincronizar();
-    return;
-  }
-  if (mio !== turno) { f.el.pause(); return; }
-  callarAmbiente(1.5);
-  fuente = f;
-  rampa(f, 1, 2);
-  estado.ambienteCargando = false;
-  estado.ambienteSuena = true;
-  sincronizar();
+  };
+  const arrancar = (url) => {
+    if (mio !== turno) return;
+    const [uno, dos] = f.els;
+    uno.src = dos.src = url;
+    dos.play().then(() => { if (f.act !== dos) dos.pause(); }).catch(() => {});
+    uno.play().then(() => {
+      if (mio !== turno) { uno.pause(); return; }
+      callarAmbiente(1.5);
+      fuente = f;
+      rampa(f, 1, 2);
+      estado.ambienteCargando = false;
+      estado.ambienteSuena = true;
+      sincronizar();
+    }).catch(fallo);
+  };
+  const a = AMBIENTES.find((x) => x.id === id);
+  if (a.archivo || pistas.has(id)) arrancar(a.archivo || pistas.get(id));
+  else cargarPista(a).then(arrancar, fallo);
 }
 
 function callarAmbiente(seg) {
@@ -238,10 +245,10 @@ function callarAmbiente(seg) {
   const f = fuente;
   fuente = null;
   f.factor = fundidoFinal; // conserva el fundido de fin de sesión mientras se apaga
-  rampa(f, 0, seg, () => f.el.pause());
+  rampa(f, 0, seg, () => { clearInterval(f.relojCruce); f.els.forEach((el) => el.pause()); });
 }
 
-// Pausa sin soltar el <audio>: reanudar el mismo elemento es lo único que el
+// Pausa sin soltar los <audio>: reanudar el mismo elemento es lo único que el
 // móvil permite hacer desde la pantalla de bloqueo.
 function pausarAmbiente(seg) {
   turno++;
@@ -249,7 +256,11 @@ function pausarAmbiente(seg) {
   estado.ambienteCargando = false;
   if (!fuente) return;
   const f = fuente;
-  rampa(f, 0, seg, () => f.el.pause());
+  rampa(f, 0, seg, () => {
+    clearInterval(f.relojCruce);
+    f.cruce = null;
+    f.els.forEach((el) => el.pause());
+  });
 }
 
 function pararAmbiente() {
@@ -261,7 +272,6 @@ function pararAmbiente() {
 }
 
 async function campana() {
-  motor();
   if (!urlCampana) {
     const sr = 44100;
     const off = new OfflineAudioContext(1, sr * 9, sr);
@@ -301,7 +311,6 @@ function videoActual() {
 }
 
 async function sonarMusica(id) {
-  motor();
   if (id !== estado.musica) { estado.musica = id; estado.pista = 0; ytErrores = 0; }
   estado.aviso = '';
   $('reproductor').hidden = false;
@@ -384,7 +393,6 @@ function pausar() {
 }
 
 function reanudar() {
-  motor();
   if (!estado.ambiente && !estado.musica) {
     estado.aviso = 'Toca primero un ambiente o una música';
     sincronizar();
@@ -393,7 +401,7 @@ function reanudar() {
   estado.terminada = false;
   if (estado.ambiente) {
     if (fuente && fuente.id === estado.ambiente) {
-      if (fuente.el.paused) fuente.el.play().catch(() => sonarAmbiente(estado.ambiente));
+      if (fuente.act.paused) fuente.act.play().catch(() => sonarAmbiente(estado.ambiente));
       else { // aún se estaba apagando: se vuelve a subir
         estado.ambienteSuena = true;
         rampa(fuente, 1, 1);
@@ -437,6 +445,7 @@ function latido() {
       if (ytListo) yt.setVolume(prefs.volMusica * f);
     }
   }
+  if (fuente) vigilarRelevo(fuente); // por si el móvil espacia los avisos del <audio>
   pintarCuenta();
 }
 

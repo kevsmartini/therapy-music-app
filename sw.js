@@ -1,5 +1,5 @@
 // Sube este número cada vez que cambies algún archivo de la app.
-const VERSION = 'calma-v5';
+const VERSION = 'calma-v6';
 
 const ARCHIVOS = [
   './',
@@ -38,7 +38,7 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
   const enCache = () => caches.match(e.request, { ignoreSearch: true });
   if (url.pathname.includes('/audio/')) {
-    e.respondWith(enCache().then((guardado) => guardado || fetch(e.request)));
+    e.respondWith(audio(e.request));
     return;
   }
   e.respondWith(
@@ -50,3 +50,30 @@ self.addEventListener('fetch', (e) => {
       .catch(() => enCache().then((guardado) => guardado || Response.error()))
   );
 });
+
+// El reproductor pide los audios por trozos (cabecera Range) para poder saltar
+// dentro de ellos; hay que contestarle con el trozo exacto desde la copia guardada.
+async function audio(peticion) {
+  const guardado = await caches.match(peticion.url);
+  if (!guardado) return fetch(peticion);
+  const rango = /^bytes=(\d*)-(\d*)$/.exec(peticion.headers.get('range') || '');
+  if (!rango) return guardado;
+  const datos = await guardado.arrayBuffer();
+  const total = datos.byteLength;
+  let desde = rango[1] ? Number(rango[1]) : total - Number(rango[2]);
+  let hasta = rango[1] && rango[2] ? Number(rango[2]) : total - 1;
+  desde = Math.max(0, desde);
+  hasta = Math.min(hasta, total - 1);
+  if (desde > hasta) {
+    return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } });
+  }
+  return new Response(datos.slice(desde, hasta + 1), {
+    status: 206,
+    headers: {
+      'Content-Type': guardado.headers.get('Content-Type') || 'audio/mpeg',
+      'Content-Range': `bytes ${desde}-${hasta}/${total}`,
+      'Content-Length': String(hasta - desde + 1),
+      'Accept-Ranges': 'bytes',
+    },
+  });
+}
